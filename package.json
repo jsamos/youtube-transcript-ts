@@ -1,0 +1,15 @@
+{
+  "name": "youtube-transcript-skill",
+  "version": "1.0.0",
+  "description": "Fetch YouTube video transcripts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "transcript": "node dist/get_transcript.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
