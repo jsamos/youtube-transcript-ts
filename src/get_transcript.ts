@@ -5,6 +5,8 @@
  *
  * Usage:
  *   node dist/get_transcript.js <video_id_or_url> [--timestamps]
+ *   node dist/get_transcript.js <video_id_or_url> --timestamps --from TIME [--to TIME] [--exclude START-END ...]
+ *   node dist/get_transcript.js <video_id_or_url> --timestamps --only TIME [TIME ...] [--exclude START-END ...]
  */
 
 const WATCH_URL = "https://www.youtube.com/watch?v={video_id}";
@@ -57,6 +59,45 @@ function formatTimestamp(seconds: number): string {
     return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   }
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+/** Parse MM:SS or HH:MM:SS to seconds. Two segments = minutes:seconds, three = hours:minutes:seconds. */
+function parseTimeString(s: string): number {
+  const trimmed = s.trim();
+  if (!trimmed) throw new Error(`Invalid time: "${s}" (expected MM:SS or HH:MM:SS)`);
+  const parts = trimmed.split(":");
+  if (parts.length === 2) {
+    const m = parseInt(parts[0], 10);
+    const sec = parseInt(parts[1], 10);
+    if (Number.isNaN(m) || Number.isNaN(sec) || m < 0 || sec < 0 || sec > 59) {
+      throw new Error(`Invalid time: "${s}" (expected MM:SS, seconds 0-59)`);
+    }
+    return m * 60 + sec;
+  }
+  if (parts.length === 3) {
+    const h = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
+    const sec = parseInt(parts[2], 10);
+    if (Number.isNaN(h) || Number.isNaN(m) || Number.isNaN(sec) || h < 0 || m < 0 || m > 59 || sec < 0 || sec > 59) {
+      throw new Error(`Invalid time: "${s}" (expected HH:MM:SS, minutes and seconds 0-59)`);
+    }
+    return h * 3600 + m * 60 + sec;
+  }
+  throw new Error(`Invalid time: "${s}" (expected MM:SS or HH:MM:SS)`);
+}
+
+/** Parse START-END exclude range to [startSec, endSec]. */
+function parseRangeString(s: string): [number, number] {
+  const idx = s.indexOf("-");
+  if (idx <= 0 || idx === s.length - 1) {
+    throw new Error(`Invalid exclude range: "${s}" (expected START-END, e.g. 1:25:21-1:27:01)`);
+  }
+  const start = parseTimeString(s.slice(0, idx));
+  const end = parseTimeString(s.slice(idx + 1));
+  if (start > end) {
+    throw new Error(`Invalid exclude range: "${s}" (start must be <= end)`);
+  }
+  return [start, end];
 }
 
 function unescapeHtml(text: string): string {
@@ -171,22 +212,122 @@ function formatTranscript(snippets: TranscriptSnippet[], withTimestamps: boolean
   return snippets.map((s) => s.text).join("\n");
 }
 
-function parseArgs(): { video: string | undefined; timestamps: boolean } {
+const FLAGS = new Set(["--timestamps", "-t", "--from", "--to", "--only", "--exclude"]);
+
+interface ParseResult {
+  video: string | undefined;
+  timestamps: boolean;
+  from?: number;
+  to?: number;
+  only?: number[];
+  exclude?: [number, number][];
+}
+
+function parseArgs(): ParseResult {
   const args = process.argv.slice(2);
-  const timestamps = args.includes("--timestamps") || args.includes("-t");
-  const video = args.find((a) => !a.startsWith("-"));
-  return { video, timestamps };
+  const result: ParseResult = { video: undefined, timestamps: false };
+  let i = 0;
+  while (i < args.length) {
+    const arg = args[i];
+    if (arg === "--timestamps" || arg === "-t") {
+      result.timestamps = true;
+      i += 1;
+      continue;
+    }
+    if (arg === "--from") {
+      if (i + 1 >= args.length) throw new Error("--from requires a time value (e.g. 00:01:00)");
+      result.from = parseTimeString(args[i + 1]);
+      i += 2;
+      continue;
+    }
+    if (arg === "--to") {
+      if (i + 1 >= args.length) throw new Error("--to requires a time value (e.g. 00:05:00)");
+      result.to = parseTimeString(args[i + 1]);
+      i += 2;
+      continue;
+    }
+    if (arg === "--only") {
+      result.only = [];
+      i += 1;
+      while (i < args.length && !FLAGS.has(args[i])) {
+        result.only.push(parseTimeString(args[i]));
+        i += 1;
+      }
+      continue;
+    }
+    if (arg === "--exclude") {
+      result.exclude = [];
+      i += 1;
+      while (i < args.length && !FLAGS.has(args[i])) {
+        result.exclude.push(parseRangeString(args[i]));
+        i += 1;
+      }
+      continue;
+    }
+    if (!arg.startsWith("-")) {
+      result.video = arg;
+      i += 1;
+      continue;
+    }
+    i += 1;
+  }
+  return result;
+}
+
+function filterSnippets(snippets: TranscriptSnippet[], opts: ParseResult): TranscriptSnippet[] {
+  let filtered: TranscriptSnippet[];
+  const hasRange = opts.from !== undefined || opts.to !== undefined;
+  const hasOnly = opts.only !== undefined && opts.only.length > 0;
+  if (hasOnly) {
+    const onlySet = new Set(opts.only);
+    filtered = snippets.filter((s) => onlySet.has(Math.round(s.start)));
+  } else if (hasRange) {
+    const fromSec = opts.from ?? 0;
+    const toSec = opts.to ?? Infinity;
+    if (fromSec > toSec) throw new Error("--from must be <= --to");
+    filtered = snippets.filter((s) => s.start >= fromSec && s.start <= toSec);
+  } else {
+    filtered = [...snippets];
+  }
+  if (opts.exclude && opts.exclude.length > 0) {
+    filtered = filtered.filter((s) => {
+      for (const [lo, hi] of opts.exclude!) {
+        if (s.start >= lo && s.start <= hi) return false;
+      }
+      return true;
+    });
+  }
+  return filtered;
 }
 
 async function main(): Promise<void> {
-  const { video, timestamps } = parseArgs();
+  let opts: ParseResult;
+  try {
+    opts = parseArgs();
+  } catch (err) {
+    console.error("Error:", err instanceof Error ? err.message : err);
+    process.exit(1);
+  }
+  const { video, timestamps, from, to, only, exclude } = opts;
+  const hasRangeOpt = from !== undefined || to !== undefined || (only !== undefined && only.length > 0) || (exclude !== undefined && exclude.length > 0);
+  if (hasRangeOpt && !timestamps) {
+    console.error("Error: Time range options (--from, --to, --only, --exclude) require --timestamps.");
+    process.exit(1);
+  }
+  if ((from !== undefined || to !== undefined) && only !== undefined && only.length > 0) {
+    console.error("Error: Cannot use --from/--to with --only.");
+    process.exit(1);
+  }
   if (!video) {
-    console.error("Usage: node dist/get_transcript.js <video_id_or_url> [--timestamps]");
+    console.error("Usage: node dist/get_transcript.js <video_id_or_url> [--timestamps] [--from TIME] [--to TIME] | [--only TIME ...] [--exclude START-END ...]");
     process.exit(1);
   }
   try {
     const videoId = extractVideoId(video);
-    const snippets = await fetchTranscriptSnippets(videoId, ["en"]);
+    let snippets = await fetchTranscriptSnippets(videoId, ["en"]);
+    if (hasRangeOpt) {
+      snippets = filterSnippets(snippets, opts);
+    }
     const transcript = formatTranscript(snippets, timestamps);
     console.log(transcript);
   } catch (err) {
